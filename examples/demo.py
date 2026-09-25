@@ -23,7 +23,11 @@ It also demonstrates the item revision history: a formal import appends a
 version only for a new id or an actual content change, availability flips
 append withdraw/re_enable versions, while dry runs, failed batches and
 same-value retries create no version; old libraries receive an idempotent
-version-1 baseline at first startup.
+version-1 baseline at first startup.  The final section demonstrates the
+wrong-answer spaced-repetition review (SM-2): a finished session's frozen
+score=0 answers become a review plan with stem/options/answer frozen at
+creation (re-creating returns the original plan), due items are queried by
+UTC date, and 0-5 grades advance the schedule idempotently by review_id.
 """
 
 from __future__ import annotations
@@ -191,6 +195,7 @@ def main() -> None:
     demo_pause_resume()
     demo_withdrawal()
     demo_revisions()
+    demo_review()
 
 
 def demo_pause_resume() -> None:
@@ -721,6 +726,170 @@ def demo_revisions() -> None:
         "GET", f"/api/items/{iid}/revisions/9999")
     assert status_code == 404, body
     print("  -> 未知题目与未知版本均返回 404 ✔")
+
+
+def demo_review() -> None:
+    """Show the wrong-answer spaced-repetition review module (SM-2)."""
+    print("\n--- 错题间隔复习（SM-2）---")
+    # 两道专用演示题：区分度远高于演示题库（a<=1.8），在 theta=0 的新会话里
+    # 必然按 DEMO-SR-1 -> DEMO-SR-2 的顺序被选中，结果确定；幂等 upsert，
+    # 重复运行只更新内容，保留曝光数与启用状态。
+    def sr_item(iid: str, discrimination: float) -> dict:
+        return {
+            "id": iid, "difficulty": 0.0, "discrimination": discrimination,
+            "content_tag": "复习演示", "stem": f"复习演示题 {iid}：2 + 2 = ?",
+            "options": [{"key": "A", "text": "4"}, {"key": "B", "text": "5"}],
+            "answer": "A",
+        }
+
+    imported = call(
+        "POST", "/api/items/import",
+        {"items": [sr_item("DEMO-SR-1", 5.0), sr_item("DEMO-SR-2", 4.9)]},
+    )
+    assert imported["valid"] is True
+    for iid in ("DEMO-SR-1", "DEMO-SR-2"):
+        assert call("PATCH", f"/api/items/{iid}/availability",
+                    {"is_active": True})["is_active"] is True
+
+    # 未结束的会话不能创建复习计划 -> 409。
+    active = call("POST", "/api/sessions",
+                  {"max_items": 2, "exposure_limit": 10_000})
+    expect_http_error("POST", f"/api/sessions/{active['id']}/review-plan")
+    print("  -> 进行中会话创建复习计划返回 409（仅已结束会话可创建）✔")
+
+    # 两题全部答错（选错误选项 B），会话以 max_items 结束。
+    session = call("POST", "/api/sessions",
+                   {"max_items": 2, "exposure_limit": 10_000})
+    sid = session["id"]
+    for turn in (1, 2):
+        item = call("POST", f"/api/sessions/{sid}/next")["item"]
+        result = call(
+            "POST", f"/api/sessions/{sid}/responses",
+            {"response_id": f"demo-sr-{sid[:8]}-{turn}",
+             "item_id": item["id"], "response": "B"},
+        )
+        assert result["correct"] is False and result["score"] == 0
+    assert call("GET", f"/api/sessions/{sid}")["status"] == "finished"
+    print("  -> 两题全部答错，会话已结束（score=0 为作答时冻结值）✔")
+
+    # 创建复习计划：冻结题干/选项/答案，初始 EF=2.5、当日（UTC）到期。
+    status, plan = call_status("POST", f"/api/sessions/{sid}/review-plan")
+    assert status == 201, plan
+    plan_id = plan["id"]
+    show("POST /api/sessions/{id}/review-plan（首次创建 -> 201）", {
+        "id": plan_id, "session_id": plan["session_id"],
+        "item_count": plan["item_count"],
+        "items": [
+            {"id": it["id"], "item_id": it["item_id"], "stem": it["stem"],
+             "answer": it["answer"], "ease_factor": it["ease_factor"],
+             "due_date": it["due_date"]}
+            for it in plan["items"]
+        ],
+    })
+    assert plan["item_count"] == 2
+    today = plan["items"][0]["due_date"]
+    assert all(it["ease_factor"] == 2.5 and it["due_date"] == today
+               and it["success_count"] == 0 for it in plan["items"])
+    assert all(it["stem"] and it["options"] and it["answer"]
+               for it in plan["items"]), "创建时必须冻结题干/选项/答案"
+
+    # 同一会话重复创建 -> 200 返回原计划，不产生重复计划/题目。
+    status, again = call_status("POST", f"/api/sessions/{sid}/review-plan")
+    assert status == 200 and again["id"] == plan_id
+    assert again["item_count"] == 2
+    print("  -> 同一会话重复创建返回原计划（200），不产生重复 ✔")
+
+    # 按 UTC 日期查询到期题：昨天 0 题、今天 2 题（初始当日到期）。
+    due_y = call("GET", f"/api/review-plans/{plan_id}/due"
+                        f"?date={_shift_date(today, -1)}")
+    due_t = call("GET", f"/api/review-plans/{plan_id}/due?date={today}")
+    assert due_y["count"] == 0 and due_t["count"] == 2
+    print(f"  -> 到期查询：{due_y['date']} 0 题 / {due_t['date']} 2 题（当日到期）✔")
+
+    first, second = plan["items"][0], plan["items"][1]
+
+    # 提交 5 分：间隔 1 天、连续成功 1、因子 2.5 -> 2.6、次日到期。
+    status, r1 = call_status(
+        "POST", f"/api/review-plans/{plan_id}/reviews",
+        {"review_id": f"demo-rev-{sid[:8]}-1",
+         "review_item_id": first["id"], "grade": 5},
+    )
+    assert status == 201, r1
+    show("POST /api/review-plans/{id}/reviews（grade=5 -> 201）", {
+        "grade": r1["grade"],
+        "ease_factor_before": r1["ease_factor_before"],
+        "ease_factor_after": r1["ease_factor_after"],
+        "interval_after": r1["interval_after"],
+        "success_count_after": r1["success_count_after"],
+        "due_date_before": r1["due_date_before"],
+        "due_date_after": r1["due_date_after"],
+    })
+    assert r1["interval_after"] == 1 and r1["success_count_after"] == 1
+    assert abs(r1["ease_factor_after"] - 2.6) < 1e-12
+    assert r1["due_date_after"] == _shift_date(today, 1)
+
+    # 相同 review_id 重放 -> 200 返回首次结果，日程不重复推进。
+    status, replay = call_status(
+        "POST", f"/api/review-plans/{plan_id}/reviews",
+        {"review_id": f"demo-rev-{sid[:8]}-1",
+         "review_item_id": first["id"], "grade": 5},
+    )
+    assert status == 200 and replay["created_at"] == r1["created_at"]
+    # 同一 review_id 换评分 -> 409；该题已排期到明天，新 review_id -> 409。
+    expect_http_error(
+        "POST", f"/api/review-plans/{plan_id}/reviews",
+        {"review_id": f"demo-rev-{sid[:8]}-1",
+         "review_item_id": first["id"], "grade": 3},
+    )
+    expect_http_error(
+        "POST", f"/api/review-plans/{plan_id}/reviews",
+        {"review_id": f"demo-rev-{sid[:8]}-new",
+         "review_item_id": first["id"], "grade": 4},
+    )
+    print("  -> review_id 重放返回首次结果（200）；换评分/未到期新提交均 409 ✔")
+
+    # 第二题评 2 分（<3）：次日重练、连续成功清零、因子 2.5 -> 2.18。
+    status, r2 = call_status(
+        "POST", f"/api/review-plans/{plan_id}/reviews",
+        {"review_id": f"demo-rev-{sid[:8]}-2",
+         "review_item_id": second["id"], "grade": 2},
+    )
+    assert status == 201, r2
+    assert r2["interval_after"] == 1 and r2["success_count_after"] == 0
+    assert abs(r2["ease_factor_after"] - 2.18) < 1e-12
+    print("  -> 评 2 分：次日重练、连续成功清零、熟练因子 2.5 -> 2.18 ✔")
+
+    # 今日到期只剩 0 题（两题都已排期到明天）；计划详情与复习记录可查。
+    due_now = call("GET", f"/api/review-plans/{plan_id}/due")
+    assert due_now["count"] == 0
+    detail = call("GET", f"/api/review-plans/{plan_id}")
+    assert [it["review_count"] for it in detail["items"]] == [1, 1]
+    history = call("GET", f"/api/review-plans/{plan_id}/reviews")
+    assert history["count"] == 2
+    show("GET /api/review-plans/{id}/reviews（复习记录，含调度前后状态）", {
+        "count": history["count"],
+        "results": [
+            {"review_item_id": r["review_item_id"], "grade": r["grade"],
+             "interval_after": r["interval_after"],
+             "ease_factor_after": r["ease_factor_after"],
+             "due_date_after": r["due_date_after"]}
+            for r in history["results"]
+        ],
+    })
+    print("  -> 两题今日均已复习并排期到明天；复习记录完整可查 ✔")
+
+    # 未知计划 -> 404；非法日期 -> 422。
+    status, _ = call_status("GET", "/api/review-plans/NO-SUCH-PLAN/due")
+    assert status == 404
+    status, _ = call_status("GET", f"/api/review-plans/{plan_id}/due?date=bad")
+    assert status == 422
+    print("  -> 未知计划 404、非法日期 422 ✔")
+
+
+def _shift_date(iso_date: str, days: int) -> str:
+    """Shift a YYYY-MM-DD date by ``days`` days (demo helper)."""
+    from datetime import date as _date, timedelta as _td
+    return (_date.fromisoformat(iso_date) + _td(days=days)).isoformat()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@
 - 提供**答卷雷同复核** `GET /api/sessions/{id}/similarity`：面向**已结束会话**，按 `item_id` 对齐双方历史作答，仅「双方选择同一错误选项」计为同错匹配（正确作答不计），每个匹配按该错误选项在全体已结束会话中的稀有程度加权（`log((该题错误作答总数+2)/(选择该错误选项的次数+1))`），分数为权重之和除以共答题数；候选至少共答 `min_shared` 题（默认 4），按分数、同错数降序及会话 ID 升序返回前 `limit` 条；统计只读 `responses` 中冻结的 `score` 与 `response`，题库改答案后结果不变；
 - 提供**单题预测概率校准** `GET /api/items/{id}/calibration`：只统计**已结束会话**中该题的历史作答，使用作答时保存的作答前 `p_correct` 与冻结 `score`（**不**按当前能力值或改动后的题目参数重算），返回样本数、实际正确率、平均预测正确率与标准化偏差 `z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]`；样本少于 30 或分母为零时 `z` 与偏离标记为 `null`，其余按 `|z|≥1.96` 给出偏离标记（未知题目 `404`，无历史样本时比率为 `null`，接口只读）；
 - 提供**题库修订历史**：每道题保存连续、只增不改的版本链。**正式导入新增题目**（`import_create`）、**正式导入导致内容实际变化**（题干/选项/答案/难度/区分度/标签，`import_update`）与**启用状态实际翻转**（`withdraw` / `re_enable`）时，在**原写事务内**记录变更来源与变更后的完整快照；同值重试、`dry_run` 预检及整批校验失败**不产生版本**。快照含题干、选项、答案、难度、区分度、标签与启用状态，**不含随作答变化的曝光次数**。提供按题目查询版本列表 `GET /api/items/{id}/revisions` 与指定版本快照 `GET /api/items/{id}/revisions/{version}`，未知题目或版本返回 `404`；后续导入**永不改写历史版本**。**旧库首次启动**为所有现存题（含初始演示题库）建立幂等的版本 1 `baseline`，重复启动不重复生成；
+- 提供**错题间隔复习**（SM-2）：已结束会话可按作答时冻结的 `score=0` 一键生成复习计划 `POST /api/sessions/{id}/review-plan`，创建时**冻结题干、选项和正确答案**（之后题库改动不影响复习内容），**同一会话重复创建返回原计划**（HTTP 200）；每题初始熟练因子 2.5、**当日到期**；支持按 UTC 日期查询到期题 `GET /api/review-plans/{id}/due` 与提交 0～5 分复习结果 `POST /api/review-plans/{id}/reviews`（`review_id` 幂等、仅接受已到期题、**同一写事务**记录结果并推进日程）：低于 3 分次日重练并清零连续成功次数，第 1、2 次成功后分别间隔 1、6 天，其后间隔为旧间隔×熟练因子四舍五入，每次结果后按 `max(1.3, 旧因子+0.1-(5-分数)×(0.08+(5-分数)×0.02))` 更新因子；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -24,8 +25,9 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 撤回启用 / 修订历史 / 雷同复核 / 概率校准
+│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 撤回启用 / 修订历史 / 雷同复核 / 概率校准 / 错题复习
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
+│   ├── review.py      # 错题间隔复习 SM-2 调度：熟练因子更新、间隔推进、连续成功计数
 │   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
 │   ├── calibration.py # 单题预测概率校准：p_correct 与实际得分的标准化偏差
 │   ├── similarity.py  # 答卷雷同复核：同错选项加权相似度（已结束会话）
@@ -508,6 +510,79 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 // 无候选：{"session_id":"<SID>","min_shared":4,"limit":20,"count":0,"results":[]}
 ```
 
+### 错题间隔复习（SM-2）
+
+把一场已结束测验中的**错题**（作答时冻结的 `score=0`）变成一份**间隔重复
+复习计划**，按经典 SM-2 算法逐题调度，帮助考生按遗忘曲线巩固薄弱点。
+
+- **创建计划** `POST /api/sessions/{id}/review-plan`：会话必须存在（`404`）且
+  **已结束**（`finished`，进行中/暂停中返回 `409`）。服务端把该会话全部
+  `score=0` 的作答各生成一道复习题，并在创建时**冻结题干、选项和正确答案**
+  （复制自创建瞬间的题库内容）——之后通过批量导入改题、撤回题目都不会改变
+  复习内容；判分依据始终是作答时冻结的 `score`，与题库后续改动无关。
+  **同一会话重复创建返回原计划**（HTTP `200`，其题目反映当前调度状态），
+  首次创建返回 `201`；`review_plans.session_id` 的唯一约束在数据库层面兜底。
+  没有错题的会话得到一份空计划（`item_count=0`）。
+- **初始调度**：每题熟练因子 `ease_factor=2.5`、间隔 0、连续成功次数 0，
+  **到期日为计划创建当日（UTC）**，因此创建后即可复习。
+- **查询到期题** `GET /api/review-plans/{id}/due?date=YYYY-MM-DD`：按 **UTC
+  日期**列出 `due_date <= date` 的复习题（含逾期未复习）；`date` 缺省为服务器
+  当前 UTC 日期，格式非法返回 `422`，未知计划 `404`。接口只读。
+- **提交复习结果** `POST /api/review-plans/{id}/reviews`：请求体
+  `{"review_id": "...", "review_item_id": "...", "grade": 0~5}`。
+  - `grade` 为 0～5 的**严格整数**自评分（布尔/浮点/字符串返回 `422`）；
+  - **仅接受已到期题**：`due_date` 晚于当前 UTC 日期的复习题返回 `409`；
+  - 复习题必须属于该计划，否则 `404`；未知计划 `404`；
+  - **`review_id` 幂等**：重复提交同一 `review_id` 返回首次结果（HTTP `200`）；
+    同一 `review_id` 用于其他计划/复习题/评分返回 `409`；
+  - **同一写事务**（`BEGIN IMMEDIATE`）内写入结果行并推进该题日程，
+    并发重放被串行化，不会重复推进。
+- **SM-2 调度规则**（每次提交新结果后生效）：
+  - 评分 **低于 3**：次日重练（间隔 1 天），连续成功次数清零；
+  - 评分 **≥ 3**：第 1、2 次连续成功分别间隔 **1、6 天**；第 3 次起间隔为
+    **旧间隔 × 熟练因子，四舍五入**（`floor(x+0.5)`，0.5 进 1；使用**更新前**的
+    熟练因子——先定间隔、后更新因子）；
+  - **每次结果后**（含不及格）按
+    `EF' = max(1.3, EF + 0.1 - (5-分数) × (0.08 + (5-分数) × 0.02))` 更新熟练因子
+    （评 5 分 +0.1，评 4 分不变，评 0 分 −0.8，下限 1.3）；
+  - 新到期日 = **复习当日（UTC）+ 新间隔**。
+- **复习记录** `GET /api/review-plans/{id}/reviews`：按提交时间升序返回全部
+  复习结果，每条含评分与调度前后状态（因子/间隔/连续成功/到期日），只读。
+- **计划详情** `GET /api/review-plans/{id}`：返回全部复习题的冻结内容与当前
+  调度状态（熟练因子、间隔、连续成功次数、复习次数、下次到期日），只读。
+
+```jsonc
+// POST /api/sessions/<SID>/review-plan  -> 201（重复创建 -> 200 原计划）
+{
+  "id": "PLAN-...", "session_id": "<SID>", "item_count": 2,
+  "created_at": "2026-09-25T08:00:00+00:00",
+  "items": [
+    {"id": "RI-...", "item_id": "ITEM-003", "response_id": "R-...",
+     "stem": "计算：7 × 8 = ?", "options": [{"key":"A","text":"54"},{"key":"B","text":"56"}],
+     "answer": "B", "ease_factor": 2.5, "interval_days": 0,
+     "success_count": 0, "review_count": 0,
+     "due_date": "2026-09-25", "last_reviewed_at": null, ...}
+  ]
+}
+
+// GET /api/review-plans/PLAN-.../due?date=2026-09-25
+// -> {"plan_id":"PLAN-...","date":"2026-09-25","count":2,"results":[...]}
+
+// POST /api/review-plans/PLAN-.../reviews  -> 201（重放 -> 200 首次结果）
+// {"review_id":"REV-1","review_item_id":"RI-...","grade":5}
+{
+  "id": "REV-1", "plan_id": "PLAN-...", "review_item_id": "RI-...",
+  "item_id": "ITEM-003", "grade": 5,
+  "ease_factor_before": 2.5, "ease_factor_after": 2.6,
+  "interval_before": 0, "interval_after": 1,
+  "success_count_before": 0, "success_count_after": 1,
+  "due_date_before": "2026-09-25", "due_date_after": "2026-09-26",
+  "created_at": "2026-09-25T09:00:00+00:00"
+}
+// 典型推进（均评 4 分）：1 天 -> 6 天 -> round(6×2.5)=15 天 -> round(15×2.5)=38 天 …
+// 评 2 分：次日重练、连续成功清零、因子 2.5 -> 2.18
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -530,6 +605,11 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | POST | `/api/sessions/{id}/responses` | 提交答案（幂等，一次 Newton 更新） |
 | POST | `/api/sessions/{id}/pause` | **暂停**活动会话（冻结剩余时限；无时限会话也可暂停） |
 | POST | `/api/sessions/{id}/resume` | **恢复**暂停中的会话（按剩余秒数重算 UTC 截止时间） |
+| POST | `/api/sessions/{id}/review-plan` | **创建错题复习计划**（已结束会话，冻结 score=0 错题的题干/选项/答案；同会话重复创建返回原计划 200） |
+| GET  | `/api/review-plans/{plan_id}` | 复习计划详情（冻结内容 + 当前 SM-2 调度状态；只读） |
+| GET  | `/api/review-plans/{plan_id}/due` | **按 UTC 日期查询到期复习题**（`?date=YYYY-MM-DD`，缺省当前 UTC 日期，含逾期；只读） |
+| POST | `/api/review-plans/{plan_id}/reviews` | **提交 0～5 分复习结果**（`review_id` 幂等；仅接受已到期题；同事务记录结果并推进 SM-2 日程） |
+| GET  | `/api/review-plans/{plan_id}/reviews` | 复习记录列表（按提交时间升序，含调度前后状态；只读） |
 
 完整字段与可交互试用见 http://localhost:8000/docs。
 
@@ -738,6 +818,40 @@ curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=2
 # 目标会话不存在 -> HTTP 404；目标会话未结束（active/paused）-> HTTP 409；
 # min_shared/limit 越界 -> HTTP 422
 
+# 9) 错题间隔复习（SM-2）：已结束会话的 score=0 错题一键生成复习计划
+#    创建时冻结题干/选项/正确答案；同一会话重复创建返回原计划（200）
+curl -s -X POST http://localhost:8000/api/sessions/$SID/review-plan
+# HTTP 201（进行中/暂停中的会话 -> 409；未知会话 -> 404）：
+# {"id":"<PLAN>","session_id":"...","item_count":2,"created_at":"...",
+#  "items":[{"id":"<RI>","item_id":"ITEM-003","stem":"...","options":[...],
+#            "answer":"B","ease_factor":2.5,"interval_days":0,"success_count":0,
+#            "review_count":0,"due_date":"2026-09-25","last_reviewed_at":null,...}]}
+# 导出 PLAN=<返回的 id>；初始题目当日（UTC）到期
+curl -s -X POST http://localhost:8000/api/sessions/$SID/review-plan   # 重复创建
+# HTTP 200，返回原计划（同一个 id，不产生重复计划/重复题目）
+
+# 9b) 按 UTC 日期查询到期题（缺省 date 为服务器当前 UTC 日期；含逾期未复习）
+curl -s "http://localhost:8000/api/review-plans/$PLAN/due?date=2026-09-25"
+# {"plan_id":"...","date":"2026-09-25","count":2,"results":[...]}
+# 日期格式非法 -> HTTP 422；未知计划 -> HTTP 404
+
+# 9c) 提交 0~5 分复习结果（review_id 为客户端幂等键，务必唯一）
+curl -s -X POST http://localhost:8000/api/review-plans/$PLAN/reviews \
+  -H 'Content-Type: application/json' \
+  -d '{"review_id": "'$(uuidgen)'", "review_item_id": "<RI>", "grade": 5}'
+# HTTP 201：{"grade":5,"ease_factor_before":2.5,"ease_factor_after":2.6,
+#  "interval_before":0,"interval_after":1,"success_count_after":1,
+#  "due_date_after":"2026-09-26", ...}
+# 相同请求体重放 -> HTTP 200 返回首次结果，日程不重复推进；
+# 同一 review_id 换评分/换题 -> HTTP 409；题目未到期 -> HTTP 409；
+# grade 越界或非整数 -> HTTP 422
+# 评 0~2 分：次日重练、连续成功清零、因子下降（下限 1.3）；
+# 评 3~5 分：第 1/2 次成功间隔 1/6 天，其后为旧间隔×熟练因子四舍五入
+
+# 9d) 计划详情与复习记录（均只读）
+curl -s http://localhost:8000/api/review-plans/$PLAN
+curl -s http://localhost:8000/api/review-plans/$PLAN/reviews
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -754,4 +868,5 @@ curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=2
 - 答卷雷同复核**无需额外配置**：不新增任何表，直接复用现有 `sessions`/`responses`；只统计 `finished` 会话，且只读作答时冻结的 `score` 与 `response`——题库改答案、题目撤回都不影响复核结果；接口完全只读，可安全地对历史会话随时调用。
 - 单题预测概率校准**无需额外配置**：同样只读 `responses` 中作答前保存的 `p_correct` 与冻结的 `score`，不按当前能力值或改动后的题目参数重算；只统计 `finished` 会话，接口完全只读。
 - 题库修订历史**无需额外配置**：服务启动时自动创建 `item_revisions` 表，并**仅在第一次**为所有现存题补建版本 1 `baseline`（幂等，重复启动不重复生成）。历史只增不改：正式导入新增/内容实际变化、启用状态实际翻转都在原写事务内追加版本；同值重试、预检与整批校验失败不产生版本；快照不含 `exposure_count`。
+- 错题间隔复习**无需额外配置**：服务启动时自动创建 `review_plans` / `review_items` / `review_results` 三张表（旧库照常迁移，既有会话与作答记录不受影响）。计划创建按会话幂等（`session_id` 唯一），复习提交按 `review_id` 幂等；所有调度推进都在 `BEGIN IMMEDIATE` 写事务内与结果记录一起提交；到期日一律按 **UTC 日期**（`YYYY-MM-DD`）比较，初始题目在计划创建当日到期。
 - SQLite + WAL 适合单机/演示与中小流量；写事务已串行化（暂停/恢复同样使用 `BEGIN IMMEDIATE`），水平扩展时可替换连接层。

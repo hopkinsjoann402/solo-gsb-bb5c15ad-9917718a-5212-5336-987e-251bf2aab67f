@@ -111,6 +111,67 @@ CREATE TABLE IF NOT EXISTS item_revisions (
     created_at     TEXT NOT NULL,  -- UTC ISO-8601, recorded inside the change transaction
     PRIMARY KEY (item_id, version)
 ) WITHOUT ROWID;
+
+-- Wrong-answer spaced-repetition review (SM-2).  New tables created
+-- IF NOT EXISTS double as the startup migration: databases from older
+-- versions simply acquire them on startup and existing sessions,
+-- responses and item history are untouched.
+--
+-- One plan per finished session (UNIQUE session_id makes creation
+-- idempotent: re-creating returns the original plan).  The plan freezes
+-- every wrong answer (score = 0 frozen at answer time) together with the
+-- item's stem/options/answer at creation time, so later bank edits never
+-- change what is reviewed.
+CREATE TABLE IF NOT EXISTS review_plans (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+    created_at  TEXT NOT NULL  -- UTC ISO-8601
+);
+
+CREATE TABLE IF NOT EXISTS review_items (
+    id               TEXT PRIMARY KEY,
+    plan_id          TEXT NOT NULL REFERENCES review_plans(id),
+    position         INTEGER NOT NULL, -- stable order inside the plan (source answer order)
+    item_id          TEXT NOT NULL,    -- frozen reference to the bank item id
+    response_id      TEXT NOT NULL,    -- source response (its frozen score is 0)
+    stem             TEXT NOT NULL,    -- frozen at plan creation
+    options          TEXT NOT NULL,    -- frozen JSON at plan creation
+    answer           TEXT NOT NULL,    -- frozen correct option key at plan creation
+    ease_factor      REAL NOT NULL DEFAULT 2.5,   -- SM-2 熟练因子, floor 1.3
+    interval_days    INTEGER NOT NULL DEFAULT 0,
+    success_count    INTEGER NOT NULL DEFAULT 0,  -- consecutive grades >= 3
+    review_count     INTEGER NOT NULL DEFAULT 0,
+    due_date         TEXT NOT NULL,    -- next due UTC date YYYY-MM-DD; creation day initially
+    last_reviewed_at TEXT,             -- UTC ISO-8601 of the latest recorded review
+    created_at       TEXT NOT NULL,
+    UNIQUE (plan_id, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_items_plan_due
+    ON review_items(plan_id, due_date);
+
+-- One row per recorded review result; the client-supplied review_id is the
+-- idempotency key, so a replay returns the first stored result.  The row
+-- snapshots the scheduling state before/after, making every schedule
+-- advance auditable; it is written in the same write transaction as the
+-- review_items update that advances the schedule.
+CREATE TABLE IF NOT EXISTS review_results (
+    id                   TEXT PRIMARY KEY, -- client review_id idempotency key
+    review_item_id       TEXT NOT NULL REFERENCES review_items(id),
+    grade                INTEGER NOT NULL CHECK (grade BETWEEN 0 AND 5),
+    ease_factor_before   REAL NOT NULL,
+    ease_factor_after    REAL NOT NULL,
+    interval_before      INTEGER NOT NULL,
+    interval_after       INTEGER NOT NULL,
+    success_count_before INTEGER NOT NULL,
+    success_count_after  INTEGER NOT NULL,
+    due_date_before      TEXT NOT NULL,
+    due_date_after       TEXT NOT NULL,
+    created_at           TEXT NOT NULL  -- UTC ISO-8601
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_results_item
+    ON review_results(review_item_id);
 """
 
 

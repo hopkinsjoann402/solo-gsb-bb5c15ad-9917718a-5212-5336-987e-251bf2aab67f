@@ -48,6 +48,22 @@ availability PATCH appends one only when the enabled state really flips;
 same-value retries, dry runs and failed batches create no version.  A legacy
 bank gets one version-1 baseline per item at first startup (idempotently).
 
+``POST /api/sessions/{id}/review-plan`` turns a finished session's wrong
+answers (``score = 0`` frozen at answer time) into a spaced-repetition
+review plan: stem, options and the correct answer are frozen at creation,
+and re-creating the plan for the same session returns the original plan.
+``GET /api/review-plans/{id}/due?date=YYYY-MM-DD`` lists the items due on a
+UTC date (initial items are due on the creation day), and
+``POST /api/review-plans/{id}/reviews`` records a 0-5 self-grade with SM-2
+scheduling: every item starts with ease factor 2.5; a grade below 3
+retrains the next day and resets the consecutive-success count, the 1st/2nd
+successes schedule 1/6 days, later intervals are the old interval times the
+ease factor rounded half up, and after every result the factor is updated
+by ``max(1.3, EF + 0.1 - (5-grade) * (0.08 + (5-grade) * 0.02))``.
+Submissions are idempotent on the client ``review_id`` (a replay returns
+the first result), accept only items already due in the plan, and record
+the result plus the schedule advance in one serialised write transaction.
+
 
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
@@ -64,13 +80,14 @@ import uuid
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from . import irt
+from . import review
 from . import revisions
 from .analysis import analyze_item
 from .calibration import calibrate_item
@@ -97,6 +114,12 @@ from .models import (
     ResponseCreate,
     ResponseHistoryOut,
     ResponseOut,
+    ReviewDueListOut,
+    ReviewItemOut,
+    ReviewPlanDetailOut,
+    ReviewResultCreate,
+    ReviewResultListOut,
+    ReviewResultOut,
     SessionCreate,
     SessionOut,
     SessionSimilarityOut,
@@ -116,9 +139,12 @@ app = FastAPI(
         "已结束会话支持答卷雷同复核（同错选项加权相似度）；"
         "单题预测概率校准对比作答前保存的 p_correct 与实际得分；"
         "题库修订历史在正式导入新增/内容变化、启用状态实际变化时"
-        "于同一写事务内追加完整快照版本（旧库首启建立基线，幂等不重复）。"
+        "于同一写事务内追加完整快照版本（旧库首启建立基线，幂等不重复）；"
+        "已结束会话可一键生成错题间隔复习计划（SM-2）：创建时冻结题干/选项/正确答案，"
+        "同一会话重复创建返回原计划；按 UTC 日期查询到期题，提交 0~5 分复习结果"
+        "（review_id 幂等、仅接受已到期题、同一写事务记录结果并推进日程）。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -1865,3 +1891,407 @@ def submit_response(
 
     payload = serialize_response(stored_row).model_dump()
     return JSONResponse(status_code=200 if replay else 201, content=payload)
+
+
+# -------------------------------------------------------------------------
+# Spaced-repetition review of wrong answers (SM-2)
+# -------------------------------------------------------------------------
+
+def get_review_plan_or_404(
+    conn: sqlite3.Connection, plan_id: str
+) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM review_plans WHERE id = ?", (plan_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="review plan not found")
+    return row
+
+
+def serialize_review_item(row: sqlite3.Row) -> ReviewItemOut:
+    return ReviewItemOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        item_id=row["item_id"],
+        response_id=row["response_id"],
+        stem=row["stem"],
+        options=parse_options(row["options"]),
+        answer=row["answer"],
+        ease_factor=row["ease_factor"],
+        interval_days=row["interval_days"],
+        success_count=row["success_count"],
+        review_count=row["review_count"],
+        due_date=row["due_date"],
+        last_reviewed_at=row["last_reviewed_at"],
+        created_at=row["created_at"],
+    )
+
+
+def serialize_review_result(
+    row: sqlite3.Row, *, plan_id: str, item_id: str
+) -> ReviewResultOut:
+    return ReviewResultOut(
+        id=row["id"],
+        plan_id=plan_id,
+        review_item_id=row["review_item_id"],
+        item_id=item_id,
+        grade=row["grade"],
+        ease_factor_before=row["ease_factor_before"],
+        ease_factor_after=row["ease_factor_after"],
+        interval_before=row["interval_before"],
+        interval_after=row["interval_after"],
+        success_count_before=row["success_count_before"],
+        success_count_after=row["success_count_after"],
+        due_date_before=row["due_date_before"],
+        due_date_after=row["due_date_after"],
+        created_at=row["created_at"],
+    )
+
+
+def review_plan_payload(
+    conn: sqlite3.Connection, plan: sqlite3.Row
+) -> ReviewPlanDetailOut:
+    items = conn.execute(
+        "SELECT * FROM review_items WHERE plan_id = ? ORDER BY position",
+        (plan["id"],),
+    ).fetchall()
+    return ReviewPlanDetailOut(
+        id=plan["id"],
+        session_id=plan["session_id"],
+        item_count=len(items),
+        created_at=plan["created_at"],
+        items=[serialize_review_item(r) for r in items],
+    )
+
+
+@app.post(
+    "/api/sessions/{session_id}/review-plan",
+    response_model=ReviewPlanDetailOut,
+    status_code=201,
+    tags=["review"],
+    summary="为已结束会话的错题（作答时冻结 score=0）创建间隔复习计划（幂等）",
+)
+def create_review_plan(
+    session_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ReviewPlanDetailOut | JSONResponse:
+    """Create the SM-2 review plan of one finished session (idempotent).
+
+    The session must exist (404) and be ``finished`` (409).  Every stored
+    answer whose **answer-time frozen** ``score`` is 0 becomes one review
+    item; the item's stem, options and correct answer are copied from the
+    bank **at creation time**, so later imports/withdrawals never change
+    what is reviewed.  Each item starts with ease factor 2.5, interval 0,
+    zero successes and is due on the creation day (UTC).
+
+    Creation is idempotent per session (``review_plans.session_id`` is
+    UNIQUE): re-creating the plan for the same session returns the
+    *original* plan with HTTP 200 (its items reflect their current
+    scheduling state) instead of making a duplicate; the first creation
+    returns 201.  A session with no wrong answers yields an empty plan.
+    """
+    replay = False
+    with transaction(conn):
+        session = get_session_or_404(conn, session_id)
+        plan = conn.execute(
+            "SELECT * FROM review_plans WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if plan is not None:
+            # Same session re-created: return the original plan (HTTP 200).
+            replay = True
+        else:
+            if session["status"] != "finished":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "只有已结束（finished）的会话才能创建错题复习计划，"
+                        f"当前 status={session['status']}"
+                    ),
+                )
+            plan_id = uuid.uuid4().hex
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat(timespec="seconds")
+            today = now_dt.date().isoformat()
+            conn.execute(
+                "INSERT INTO review_plans (id, session_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (plan_id, session_id, now),
+            )
+            # score is the answer-time frozen value; stem/options/answer are
+            # copied from the bank NOW and frozen into the plan.
+            wrong = conn.execute(
+                """
+                SELECT r.id AS response_id, r.item_id AS item_id,
+                       i.stem AS stem, i.options AS options, i.answer AS answer
+                  FROM responses r
+                  JOIN items i ON i.id = r.item_id
+                 WHERE r.session_id = ? AND r.score = 0
+                 ORDER BY r.created_at, r.id
+                """,
+                (session_id,),
+            ).fetchall()
+            conn.executemany(
+                """
+                INSERT INTO review_items
+                    (id, plan_id, position, item_id, response_id,
+                     stem, options, answer,
+                     ease_factor, interval_days, success_count, review_count,
+                     due_date, last_reviewed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, ?)
+                """,
+                [
+                    (
+                        uuid.uuid4().hex,
+                        plan_id,
+                        position,
+                        w["item_id"],
+                        w["response_id"],
+                        w["stem"],
+                        w["options"],
+                        w["answer"],
+                        review.INITIAL_EASE_FACTOR,
+                        today,
+                        now,
+                    )
+                    for position, w in enumerate(wrong)
+                ],
+            )
+            plan = conn.execute(
+                "SELECT * FROM review_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+        payload = review_plan_payload(conn, plan).model_dump()
+    return JSONResponse(status_code=200 if replay else 201, content=payload)
+
+
+@app.get(
+    "/api/review-plans/{plan_id}",
+    response_model=ReviewPlanDetailOut,
+    tags=["review"],
+    summary="查询复习计划详情（冻结题干/选项/答案 + 当前 SM-2 调度状态；只读）",
+)
+def get_review_plan(
+    plan_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ReviewPlanDetailOut:
+    """Return one review plan with every item's frozen content and current
+    SM-2 scheduling state.  Strictly read-only; unknown plan -> 404."""
+    plan = get_review_plan_or_404(conn, plan_id)
+    return review_plan_payload(conn, plan)
+
+
+@app.get(
+    "/api/review-plans/{plan_id}/due",
+    response_model=ReviewDueListOut,
+    tags=["review"],
+    summary="按 UTC 日期查询到期复习题（含逾期未复习；缺省为当前 UTC 日期；只读）",
+)
+def review_plan_due(
+    plan_id: str,
+    date: date | None = Query(
+        None,
+        description="UTC 日期（YYYY-MM-DD）；缺省为服务器当前 UTC 日期",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ReviewDueListOut:
+    """List the plan items due on a UTC date (``due_date <= date``).
+
+    Overdue items (an earlier ``due_date`` never reviewed) are included.
+    Items of a freshly created plan are due on the creation day, so the
+    default (today) returns them immediately.  Strictly read-only; an
+    unknown plan returns 404 and a malformed date is rejected with 422 by
+    request validation.
+    """
+    plan = get_review_plan_or_404(conn, plan_id)
+    query_date = date or datetime.now(timezone.utc).date()
+    rows = conn.execute(
+        """
+        SELECT * FROM review_items
+         WHERE plan_id = ? AND due_date <= ?
+         ORDER BY due_date, position
+        """,
+        (plan["id"], query_date.isoformat()),
+    ).fetchall()
+    return ReviewDueListOut(
+        plan_id=plan["id"],
+        date=query_date.isoformat(),
+        count=len(rows),
+        results=[serialize_review_item(r) for r in rows],
+    )
+
+
+@app.post(
+    "/api/review-plans/{plan_id}/reviews",
+    response_model=ReviewResultOut,
+    status_code=201,
+    tags=["review"],
+    summary="提交 0~5 分复习结果（review_id 幂等；仅接受已到期题；同事务记录并推进日程）",
+)
+def submit_review(
+    plan_id: str,
+    body: ReviewResultCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ReviewResultOut | JSONResponse:
+    """Record one self-graded review (0..5) and advance the SM-2 schedule.
+
+    Idempotency contract: the client-generated ``review_id`` is the dedupe
+    key, looked up under the write lock, so a burst of retries observes the
+    first committed record and is replayed with HTTP 200; reusing the id
+    with a different plan/item/grade is rejected with 409.
+
+    Only items **already due** in this plan are accepted: an item whose
+    ``due_date`` is after the current UTC date is rejected with 409 (a
+    replayed ``review_id`` is still served first).  An unknown plan or an
+    item that does not belong to it returns 404.
+
+    For a new review the result row and the schedule advance are written in
+    the SAME serialised (``BEGIN IMMEDIATE``) transaction: grade < 3
+    schedules the next day and resets the consecutive-success count;
+    otherwise the 1st/2nd success schedules 1/6 days and later intervals
+    are the old interval times the (pre-update) ease factor, rounded half
+    up; the ease factor is then updated by
+    ``max(1.3, EF + 0.1 - (5-grade) * (0.08 + (5-grade) * 0.02))`` and the
+    next due date is ``review UTC date + new interval``.
+    """
+    replay = False
+    with transaction(conn):
+        plan = get_review_plan_or_404(conn, plan_id)
+
+        # 1) Idempotency replay, checked under the write lock.
+        existing = conn.execute(
+            """
+            SELECT rr.*, ri.plan_id AS item_plan_id, ri.item_id AS item_id
+              FROM review_results rr
+              JOIN review_items ri ON ri.id = rr.review_item_id
+             WHERE rr.id = ?
+            """,
+            (body.review_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["item_plan_id"] != plan["id"]
+                or existing["review_item_id"] != body.review_item_id
+                or existing["grade"] != body.grade
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="review_id 已被其他计划、复习题或评分使用",
+                )
+            stored_row = existing
+            item_id = existing["item_id"]
+            replay = True
+        else:
+            # 2) The item must belong to this plan and already be due.
+            item = conn.execute(
+                "SELECT * FROM review_items WHERE id = ? AND plan_id = ?",
+                (body.review_item_id, plan["id"]),
+            ).fetchone()
+            if item is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="review item not found in this plan",
+                )
+            now_dt = datetime.now(timezone.utc)
+            today = now_dt.date()
+            if date.fromisoformat(item["due_date"]) > today:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"复习题尚未到期（到期日 {item['due_date']}，当前 UTC "
+                        f"日期 {today.isoformat()}），到期后才能提交复习结果"
+                    ),
+                )
+
+            # 3) SM-2 advance + result row, in the same write transaction.
+            update = review.advance_schedule(
+                ease_factor=item["ease_factor"],
+                interval_days=item["interval_days"],
+                success_count=item["success_count"],
+                grade=body.grade,
+            )
+            new_due = (today + timedelta(days=update.interval_days)).isoformat()
+            now = now_dt.isoformat(timespec="seconds")
+            conn.execute(
+                """
+                INSERT INTO review_results
+                    (id, review_item_id, grade,
+                     ease_factor_before, ease_factor_after,
+                     interval_before, interval_after,
+                     success_count_before, success_count_after,
+                     due_date_before, due_date_after, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    body.review_id,
+                    body.review_item_id,
+                    body.grade,
+                    item["ease_factor"],
+                    update.ease_factor,
+                    item["interval_days"],
+                    update.interval_days,
+                    item["success_count"],
+                    update.success_count,
+                    item["due_date"],
+                    new_due,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE review_items
+                   SET ease_factor = ?, interval_days = ?, success_count = ?,
+                       review_count = review_count + 1,
+                       due_date = ?, last_reviewed_at = ?
+                 WHERE id = ?
+                """,
+                (
+                    update.ease_factor,
+                    update.interval_days,
+                    update.success_count,
+                    new_due,
+                    now,
+                    body.review_item_id,
+                ),
+            )
+            stored_row = conn.execute(
+                "SELECT * FROM review_results WHERE id = ?", (body.review_id,)
+            ).fetchone()
+            item_id = item["item_id"]
+
+    payload = serialize_review_result(
+        stored_row, plan_id=plan["id"], item_id=item_id
+    ).model_dump()
+    return JSONResponse(status_code=200 if replay else 201, content=payload)
+
+
+@app.get(
+    "/api/review-plans/{plan_id}/reviews",
+    response_model=ReviewResultListOut,
+    tags=["review"],
+    summary="查询计划的复习记录（按提交时间升序；只读）",
+)
+def review_plan_results(
+    plan_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ReviewResultListOut:
+    """List every recorded review result of one plan, oldest first.
+
+    Each entry snapshots the scheduling state before/after its review, so
+    the full SM-2 progression is auditable.  Strictly read-only; an unknown
+    plan returns 404.
+    """
+    plan = get_review_plan_or_404(conn, plan_id)
+    rows = conn.execute(
+        """
+        SELECT rr.*, ri.item_id AS item_id
+          FROM review_results rr
+          JOIN review_items ri ON ri.id = rr.review_item_id
+         WHERE ri.plan_id = ?
+         ORDER BY rr.created_at, rr.id
+        """,
+        (plan["id"],),
+    ).fetchall()
+    return ReviewResultListOut(
+        plan_id=plan["id"],
+        count=len(rows),
+        results=[
+            serialize_review_result(r, plan_id=plan["id"], item_id=r["item_id"])
+            for r in rows
+        ],
+    )

@@ -501,3 +501,104 @@ class ProgressOut(BaseModel):
 class HealthOut(BaseModel):
     status: str
     bank_size: int
+
+
+# ---- spaced-repetition review (wrong answers, SM-2) -------------------------
+
+class ReviewItemOut(BaseModel):
+    """One wrong answer frozen into a review plan, with its SM-2 schedule."""
+
+    id: str = Field(..., description="复习题 ID（计划内唯一，提交复习结果时引用）")
+    plan_id: str = Field(..., description="所属复习计划 ID")
+    item_id: str = Field(..., description="题库原题 ID（冻结引用）")
+    response_id: str = Field(
+        ..., description="来源作答记录 ID（其 score=0 为作答时冻结值）"
+    )
+    stem: str = Field(..., description="创建计划时冻结的题干")
+    options: list[OptionOut] = Field(..., description="创建计划时冻结的选项")
+    answer: str = Field(..., description="创建计划时冻结的正确答案选项键")
+    ease_factor: float = Field(
+        ..., description="当前熟练因子（初始 2.5，每次复习后更新，下限 1.3）"
+    )
+    interval_days: int = Field(..., description="当前间隔天数")
+    success_count: int = Field(
+        ..., description="连续成功（评分 >= 3）次数；评分低于 3 分清零"
+    )
+    review_count: int = Field(..., description="已记录的复习次数")
+    due_date: str = Field(
+        ..., description="下次到期的 UTC 日期（YYYY-MM-DD）；初始为计划创建当日"
+    )
+    last_reviewed_at: str | None = Field(
+        None, description="最近一次复习的 UTC 时间；从未复习为 null"
+    )
+    created_at: str = Field(..., description="加入计划的 UTC 时间")
+
+
+class ReviewPlanOut(BaseModel):
+    id: str = Field(..., description="复习计划 ID")
+    session_id: str = Field(..., description="来源（已结束）会话 ID")
+    item_count: int = Field(
+        ..., description="计划内复习题数量（该会话作答时冻结 score=0 的题数）"
+    )
+    created_at: str = Field(..., description="计划创建的 UTC 时间")
+
+
+class ReviewPlanDetailOut(ReviewPlanOut):
+    items: list[ReviewItemOut] = Field(
+        default_factory=list, description="计划内全部复习题（按来源作答顺序）"
+    )
+
+
+class ReviewDueListOut(BaseModel):
+    plan_id: str
+    date: str = Field(..., description="本次查询使用的 UTC 日期（YYYY-MM-DD）")
+    count: int = Field(..., description="到期复习题数量（due_date <= 查询日期）")
+    results: list[ReviewItemOut] = Field(default_factory=list)
+
+
+class ReviewResultCreate(BaseModel):
+    """Submit one self-graded review result (0..5) for a due plan item."""
+
+    review_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键，建议使用 UUID；重复提交返回首次结果",
+    )
+    review_item_id: str = Field(
+        ..., description="复习题 ID（由计划详情或到期查询返回）"
+    )
+    grade: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=5,
+        description="复习自评分 0~5；低于 3 分次日重练并清零连续成功次数",
+    )
+
+
+class ReviewResultOut(BaseModel):
+    """One recorded review result with the before/after scheduling state."""
+
+    id: str = Field(..., description="即客户端幂等键 review_id")
+    plan_id: str
+    review_item_id: str
+    item_id: str = Field(..., description="题库原题 ID（冻结引用）")
+    grade: int
+    ease_factor_before: float
+    ease_factor_after: float
+    interval_before: int
+    interval_after: int
+    success_count_before: int
+    success_count_after: int
+    due_date_before: str = Field(..., description="复习前的到期 UTC 日期")
+    due_date_after: str = Field(
+        ..., description="推进后的下次到期 UTC 日期（复习当日 + 新间隔）"
+    )
+    created_at: str = Field(..., description="结果记录的 UTC 时间")
+
+
+class ReviewResultListOut(BaseModel):
+    plan_id: str
+    count: int
+    results: list[ReviewResultOut] = Field(default_factory=list)
