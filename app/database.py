@@ -111,6 +111,58 @@ CREATE TABLE IF NOT EXISTS item_revisions (
     created_at     TEXT NOT NULL,  -- UTC ISO-8601, recorded inside the change transaction
     PRIMARY KEY (item_id, version)
 ) WITHOUT ROWID;
+
+-- Wrong-question spaced review (SM-2).  New tables created IF NOT EXISTS also
+-- serve as the migration: databases from older versions simply acquire them
+-- on startup and behave exactly as before until a plan is created.
+--
+-- One finished session maps to at most one plan (UNIQUE(session_id)), so a
+-- repeated creation returns the original plan.  Each plan item freezes the
+-- stem/options/answer at creation time: later bank edits or withdrawals never
+-- change the review content.  due_date is a UTC calendar date (YYYY-MM-DD);
+-- items are initially due on the creation day.
+CREATE TABLE IF NOT EXISTS review_plans (
+    id         TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+    created_at TEXT NOT NULL  -- UTC ISO-8601
+);
+
+CREATE TABLE IF NOT EXISTS review_items (
+    id            TEXT PRIMARY KEY,
+    plan_id       TEXT NOT NULL REFERENCES review_plans(id),
+    item_id       TEXT NOT NULL REFERENCES items(id), -- source bank item (content frozen below)
+    stem          TEXT NOT NULL,  -- stem frozen at plan creation
+    options       TEXT NOT NULL,  -- options JSON frozen at plan creation
+    answer        TEXT NOT NULL,  -- correct option key frozen at plan creation
+    ease_factor   REAL NOT NULL DEFAULT 2.5,   -- SM-2 ease factor, floor 1.3
+    interval_days INTEGER NOT NULL DEFAULT 0,  -- current interval in days
+    repetitions   INTEGER NOT NULL DEFAULT 0,  -- consecutive successes (score >= 3)
+    due_date      TEXT NOT NULL,  -- UTC date YYYY-MM-DD; initially the creation day
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_items_plan ON review_items(plan_id);
+CREATE INDEX IF NOT EXISTS idx_review_items_due ON review_items(due_date);
+
+-- Review results: review_id is the client idempotency key.  The before/after
+-- snapshots let a replayed submission return the first result verbatim.
+CREATE TABLE IF NOT EXISTS review_results (
+    review_id           TEXT PRIMARY KEY, -- client-supplied idempotency key
+    review_item_id      TEXT NOT NULL REFERENCES review_items(id),
+    score               INTEGER NOT NULL CHECK (score BETWEEN 0 AND 5),
+    ease_factor_before  REAL NOT NULL,
+    ease_factor_after   REAL NOT NULL,
+    interval_before     INTEGER NOT NULL,
+    interval_after      INTEGER NOT NULL,
+    repetitions_before  INTEGER NOT NULL,
+    repetitions_after   INTEGER NOT NULL,
+    due_date_before     TEXT NOT NULL,
+    due_date_after      TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_results_item ON review_results(review_item_id);
 """
 
 

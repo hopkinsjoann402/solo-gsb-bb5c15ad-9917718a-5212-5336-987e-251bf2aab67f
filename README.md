@@ -17,6 +17,7 @@
 - 提供**答卷雷同复核** `GET /api/sessions/{id}/similarity`：面向**已结束会话**，按 `item_id` 对齐双方历史作答，仅「双方选择同一错误选项」计为同错匹配（正确作答不计），每个匹配按该错误选项在全体已结束会话中的稀有程度加权（`log((该题错误作答总数+2)/(选择该错误选项的次数+1))`），分数为权重之和除以共答题数；候选至少共答 `min_shared` 题（默认 4），按分数、同错数降序及会话 ID 升序返回前 `limit` 条；统计只读 `responses` 中冻结的 `score` 与 `response`，题库改答案后结果不变；
 - 提供**单题预测概率校准** `GET /api/items/{id}/calibration`：只统计**已结束会话**中该题的历史作答，使用作答时保存的作答前 `p_correct` 与冻结 `score`（**不**按当前能力值或改动后的题目参数重算），返回样本数、实际正确率、平均预测正确率与标准化偏差 `z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]`；样本少于 30 或分母为零时 `z` 与偏离标记为 `null`，其余按 `|z|≥1.96` 给出偏离标记（未知题目 `404`，无历史样本时比率为 `null`，接口只读）；
 - 提供**题库修订历史**：每道题保存连续、只增不改的版本链。**正式导入新增题目**（`import_create`）、**正式导入导致内容实际变化**（题干/选项/答案/难度/区分度/标签，`import_update`）与**启用状态实际翻转**（`withdraw` / `re_enable`）时，在**原写事务内**记录变更来源与变更后的完整快照；同值重试、`dry_run` 预检及整批校验失败**不产生版本**。快照含题干、选项、答案、难度、区分度、标签与启用状态，**不含随作答变化的曝光次数**。提供按题目查询版本列表 `GET /api/items/{id}/revisions` 与指定版本快照 `GET /api/items/{id}/revisions/{version}`，未知题目或版本返回 `404`；后续导入**永不改写历史版本**。**旧库首次启动**为所有现存题（含初始演示题库）建立幂等的版本 1 `baseline`，重复启动不重复生成；
+- 提供**错题间隔复习**（SM-2）：已结束会话可按作答时冻结的 `score=0` 错题创建复习计划 `POST /api/sessions/{id}/review-plan`（创建时冻结题干/选项/正确答案，**同一会话重复创建返回原计划**）；每题初始熟练因子 `2.5`、当日（UTC）到期；支持按 UTC 日期查询到期题 `GET /api/review/due` 与提交 0~5 分复习结果 `POST /api/review/items/{id}/results`（`review_id` 幂等、仅接受已到期题、同一写事务记录结果并推进日程）：评分低于 3 分次日重练并清零连续成功次数，第 1、2 次成功间隔分别为 1、6 天，其后间隔为旧间隔×熟练因子四舍五入，每次结果后按 `max(1.3, EF+0.1−(5−q)×(0.08+(5−q)×0.02))` 更新熟练因子；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -24,11 +25,12 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 撤回启用 / 修订历史 / 雷同复核 / 概率校准
+│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 撤回启用 / 修订历史 / 雷同复核 / 概率校准 / 错题复习
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
 │   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
 │   ├── calibration.py # 单题预测概率校准：p_correct 与实际得分的标准化偏差
 │   ├── similarity.py  # 答卷雷同复核：同错选项加权相似度（已结束会话）
+│   ├── review.py      # 错题间隔复习：SM-2 熟练因子更新与日程推进（纯算法）
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
 │   ├── revisions.py   # 题库修订历史：变更判定、同事务版本记录、首启基线（幂等）
 │   ├── database.py    # SQLite 连接、建表、初始化
@@ -508,6 +510,52 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 // 无候选：{"session_id":"<SID>","min_shared":4,"limit":20,"count":0,"results":[]}
 ```
 
+### 错题间隔复习（SM-2）
+
+把已结束会话里的错题纳入间隔重复复习，帮助考生按遗忘曲线巩固薄弱点：
+
+- **创建计划** `POST /api/sessions/{id}/review-plan`：仅**已结束**（`finished`）会话可创建
+  （进行中/暂停中返回 `409`，未知会话 `404`）。计划收录该场**作答时冻结 `score = 0`** 的
+  每一道错题，并在创建时把**题干、选项与正确答案冻结**进计划——之后题库改题、撤回都不影响
+  复习内容。每道复习题初始：熟练因子 `ease_factor = 2.5`、间隔 `0` 天、连续成功次数 `0`、
+  **到期日为创建当日（UTC）**，即初始题目当日即可复习。会话没有错题时创建空计划
+  （`item_count = 0`）。首次创建返回 `201`；**同一会话重复创建返回原计划**（`200`，
+  不新增任何行；`review_plans.session_id` 唯一约束在数据库层兜底并发）。
+- **查询到期题** `GET /api/review/due?date=YYYY-MM-DD`：按 **UTC 日期**返回
+  `due_date <= date` 的全部复习题（`date` 缺省为今天，非法日期 `422`；已过期未复习的题
+  保持到期状态），按到期日、复习题 ID 升序排列，含冻结的题干/选项/答案与当前日程状态。
+  接口只读。
+- **提交复习结果** `POST /api/review/items/{review_item_id}/results`，
+  请求体 `{"review_id": "...", "score": 0..5}`：
+  - `review_id` 为客户端幂等键：**重放返回首次结果**（`200`，首次为 `201`），不会重复
+    推进日程；`review_id` 被其他复习题使用返回 `409`；未知复习题 `404`；
+  - **仅接受计划中已到期题**（`due_date <=` 今天 UTC）：未到期返回 `409` 且不写任何数据；
+    `score` 必须为 `0~5` 的整数（越界、小数、布尔均 `422`）；
+  - 结果记录（含前后快照）与日程推进在**同一 `BEGIN IMMEDIATE` 写事务**内完成：
+    - 评分 **< 3**：次日重练（间隔 1 天），连续成功次数清零；
+    - 评分 **>= 3**：第 1、2 次连续成功的间隔分别为 1、6 天，第 3 次起间隔为
+      `旧间隔 × 熟练因子` **四舍五入**（使用**更新前**的熟练因子）；
+    - 每次结果后熟练因子按 `EF' = max(1.3, EF + 0.1 − (5−q)×(0.08 + (5−q)×0.02))`
+      更新（无论评分高低，下限 1.3）；
+    - 新到期日 = 复习当日（UTC）+ 新间隔天数；首次结果总会把到期日至少推后一天，
+      因此同一复习题同一天不会被第二个**新** `review_id` 重复推进。
+
+```jsonc
+// POST /api/review/items/<REVIEW_ITEM_ID>/results  {"review_id":"rev-001","score":4}
+// HTTP 201 —— 首次记录并推进日程
+{
+  "review_id": "rev-001",
+  "review_item_id": "4d10...",
+  "score": 4,
+  "ease_factor_before": 2.5, "ease_factor_after": 2.5,   // q=4 时 EF 增减相抵
+  "interval_before": 0, "interval_after": 1,             // 第 1 次成功 -> 1 天
+  "repetitions_before": 0, "repetitions_after": 1,
+  "due_date_before": "2026-09-25", "due_date_after": "2026-09-26",
+  "created_at": "2026-09-25T08:00:00+00:00"
+}
+// 相同 review_id 重放 -> HTTP 200，原样返回上表，不重复推进日程
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -530,6 +578,9 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | POST | `/api/sessions/{id}/responses` | 提交答案（幂等，一次 Newton 更新） |
 | POST | `/api/sessions/{id}/pause` | **暂停**活动会话（冻结剩余时限；无时限会话也可暂停） |
 | POST | `/api/sessions/{id}/resume` | **恢复**暂停中的会话（按剩余秒数重算 UTC 截止时间） |
+| POST | `/api/sessions/{id}/review-plan` | **创建错题复习计划**（已结束会话作答时冻结 score=0 的错题；创建时冻结题干/选项/答案；同一会话重复创建返回原计划） |
+| GET  | `/api/review/due` | **按 UTC 日期查询到期复习题**（`date` 缺省为今天；含冻结内容与日程状态；只读） |
+| POST | `/api/review/items/{review_item_id}/results` | **提交 0~5 分复习结果**（`review_id` 幂等，重放返回首次结果；仅接受已到期题；同一写事务记录结果并按 SM-2 推进日程） |
 
 完整字段与可交互试用见 http://localhost:8000/docs。
 
@@ -738,6 +789,52 @@ curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=2
 # 目标会话不存在 -> HTTP 404；目标会话未结束（active/paused）-> HTTP 409；
 # min_shared/limit 越界 -> HTTP 422
 
+# 9) 错题间隔复习（SM-2）：已结束会话 -> 创建计划 -> 查询到期 -> 提交 0~5 分结果
+#    先启动服务：docker compose up -d --build（API 地址 http://localhost:8000）
+#    以下 $SID 为一场已结束（finished）且答错过题的会话
+curl -s -X POST http://localhost:8000/api/sessions/$SID/review-plan
+# HTTP 201：
+# {"id":"<PLAN_ID>","session_id":"$SID","item_count":2,
+#  "items":[{"id":"<REVIEW_ITEM_ID>","item_id":"ITEM-003",
+#            "stem":"计算：47 − 29 = ?","options":[{"key":"A","text":"18"},...],
+#            "answer":"A","ease_factor":2.5,"interval_days":0,"repetitions":0,
+#            "due_date":"2026-09-25",   # 初始题目当日（UTC）到期
+#            "created_at":"...","updated_at":"..."}, ...],
+#  "created_at":"..."}
+# 题干/选项/正确答案在创建时冻结，之后题库改题/撤回不影响复习内容；
+# 会话未结束 -> HTTP 409；会话不存在 -> HTTP 404
+
+# 同一会话重复创建 -> HTTP 200，返回原计划（不新增任何行）
+curl -s -X POST http://localhost:8000/api/sessions/$SID/review-plan
+
+# 按 UTC 日期查询到期题（date 缺省为今天；已过期未复习的题保持到期）
+curl -s "http://localhost:8000/api/review/due"
+curl -s "http://localhost:8000/api/review/due?date=2026-09-25"
+# {"date":"2026-09-25","count":2,"results":[ ...复习题（含冻结内容与日程状态）... ]}
+# date 非法（如 2026-13-99）-> HTTP 422
+
+# 提交复习结果：score 为 0~5 的整数，review_id 为客户端幂等键
+curl -s -X POST http://localhost:8000/api/review/items/<REVIEW_ITEM_ID>/results \
+  -H 'Content-Type: application/json' \
+  -d '{"review_id": "'$(uuidgen)'", "score": 4}'
+# HTTP 201：
+# {"review_id":"...","review_item_id":"<REVIEW_ITEM_ID>","score":4,
+#  "ease_factor_before":2.5,"ease_factor_after":2.5,
+#  "interval_before":0,"interval_after":1,        # 第 1 次成功 -> 间隔 1 天
+#  "repetitions_before":0,"repetitions_after":1,
+#  "due_date_before":"2026-09-25","due_date_after":"2026-09-26",  # 复习当日+新间隔
+#  "created_at":"..."}
+# 评分 < 3 -> 次日重练（间隔 1 天）并清零连续成功次数；
+# 第 1、2 次成功间隔 1、6 天，其后为 旧间隔×熟练因子 四舍五入；
+# 每次结果后 EF = max(1.3, EF + 0.1 − (5−q)×(0.08+(5−q)×0.02))
+
+# 相同 review_id 重放 -> HTTP 200，返回首次结果，不重复推进日程
+curl -s -X POST http://localhost:8000/api/review/items/<REVIEW_ITEM_ID>/results \
+  -H 'Content-Type: application/json' \
+  -d '{"review_id": "<同一个 review_id>", "score": 4}'
+# 复习题未到期（due_date 在未来）-> HTTP 409；未知复习题 -> HTTP 404；
+# score 越界/非整数 -> HTTP 422；review_id 被其他复习题使用 -> HTTP 409
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -754,4 +851,5 @@ curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=2
 - 答卷雷同复核**无需额外配置**：不新增任何表，直接复用现有 `sessions`/`responses`；只统计 `finished` 会话，且只读作答时冻结的 `score` 与 `response`——题库改答案、题目撤回都不影响复核结果；接口完全只读，可安全地对历史会话随时调用。
 - 单题预测概率校准**无需额外配置**：同样只读 `responses` 中作答前保存的 `p_correct` 与冻结的 `score`，不按当前能力值或改动后的题目参数重算；只统计 `finished` 会话，接口完全只读。
 - 题库修订历史**无需额外配置**：服务启动时自动创建 `item_revisions` 表，并**仅在第一次**为所有现存题补建版本 1 `baseline`（幂等，重复启动不重复生成）。历史只增不改：正式导入新增/内容实际变化、启用状态实际翻转都在原写事务内追加版本；同值重试、预检与整批校验失败不产生版本；快照不含 `exposure_count`。
+- 错题间隔复习**无需额外配置**：服务启动时自动创建 `review_plans` / `review_items` / `review_results` 三张表（旧库启动即完成迁移）；容器启动即自动完成依赖安装与建表（`docker compose up -d --build` 后即可调用）。计划内容在创建时冻结，题库后续改题/撤回不影响复习；到期日均按 **UTC 日期**计算；复习结果以 `review_id` 幂等，写操作同样使用 `BEGIN IMMEDIATE` 串行化。
 - SQLite + WAL 适合单机/演示与中小流量；写事务已串行化（暂停/恢复同样使用 `BEGIN IMMEDIATE`），水平扩展时可替换连接层。
